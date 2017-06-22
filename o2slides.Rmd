@@ -1,0 +1,281 @@
+---
+title: "O2 Time Series Demo"
+author: "Alison Appling"
+date: "June 19, 2017"
+output: 
+  ioslides_presentation: 
+  theme: flatly
+highlight: bclear
+css: o2demo.css
+smaller: yes
+widescreen: yes
+---
+  
+  ```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(dataRetrieval)
+library(geoknife)
+library(dygraphs)
+library(xts)
+library(dplyr)
+library(ggplot2)
+library(streamMetabolizer)
+library(mda.streams)
+library(unitted)
+library(cowplot)
+```
+
+## Get: `dataRetrieval` for NWIS/WQP data
+
+```{r getnwis, cache=TRUE, echo=TRUE, eval=FALSE}
+library(dataRetrieval)
+o2data_raw <- readNWISuv(
+  siteNumbers='02336300', parameterCd='00300', 
+  startDate='2013-01-01', endDate='2017-06-18', tz='UTC')
+o2data <- renameNWISColumns(o2data_raw)
+```
+
+```{r loadnwis, include=FALSE}
+# saveRDS(o2data, 'o2data.Rds')
+o2data <- readRDS('o2data.Rds')
+```
+
+## Get: `dataRetrieval` for NWIS/WQP data
+
+```{r print_getnwis}
+head(o2data, 10)
+```
+
+## Get: `geoknife` for spatial data
+
+```{r getgdp, echo=TRUE, eval=FALSE}
+library(geoknife)
+stencil <- simplegeom(data.frame(c(-84.40764,33.82031)))
+daymet <- 'https://thredds.daac.ornl.gov/thredds/dodsC/daymet-v3-agg/na.ncml'
+fabric <- webdata(url=daymet, variable='srad', times=c('2013-01-01','2017-01-01'))
+job_out <- geoknife(stencil, fabric, REQUIRE_FULL_COVERAGE='false', wait=TRUE)
+gdpdata <- result(job_out, with.units = TRUE)
+names(gdpdata)[2] <- 'srad'
+```
+
+```{r loadgdp, include=FALSE}
+# saveRDS(gdpdata, 'gdpdata.Rds')
+gdpdata <- readRDS('gdpdata.Rds')
+```
+
+## Get: `geoknife` for spatial data
+
+```{r print_getgdp}
+head(gdpdata, 10)
+```
+
+## Explore: dygraphs for interaction
+
+```{r dygraph, echo=TRUE}
+library(dygraphs)
+library(xts)
+o2data_xts <- xts(o2data$DO_Inst, o2data$dateTime)
+d <- dygraph(o2data_xts) %>% dygraphs::dyOptions(colors='cornflowerblue')
+```
+
+## Explore: dygraphs for interaction
+
+```{r print_dygraph}
+d
+```
+
+## Explore: ggplot for complexity
+
+```{r ggplot, echo=TRUE}
+library(ggplot2)
+g <- ggplot(o2data, aes(x=dateTime, y=DO_Inst, color=DO_Inst_cd)) +
+  geom_line() + theme_bw()
+```
+
+## Explore: ggplot for complexity
+
+```{r print_ggplot}
+g
+```
+
+## Clean: remove flagged values
+
+```{r flags, echo=TRUE}
+library(dplyr)
+o2data_accepted <- filter(o2data, DO_Inst_cd=='A')
+```
+
+## Clean: remove flagged values
+
+```{r print_flags}
+tail(o2data_accepted, 10)
+```
+
+## Analyze: low-O2 events
+
+A common O2 criterion: daily mean >= 5 mg/L, daily minimum >= 4 mg/L
+```{r lowo2, echo=TRUE}
+library(dplyr)
+o2data_daily <- o2data_accepted %>%
+  mutate(date=as.Date(dateTime)) %>%
+  group_by(date) %>%
+  summarize(DO_Mean=mean(DO_Inst),
+            DO_Min=min(DO_Inst),
+            DO_Max=max(DO_Inst)) %>%
+  mutate(Violation = DO_Mean < 5.0 | DO_Min < 4.0)
+```
+
+## Analyze: low-O2 events
+
+```{r prep_lowo2plot, echo=TRUE}
+g <- ggplot(o2data_daily, aes(x=date)) +
+  geom_ribbon(aes(ymin=DO_Min, ymax=DO_Max), fill='blue', alpha=0.2) +
+  geom_line(aes(y=DO_Mean), color='blue') +
+  geom_point(data=filter(o2data_daily, Violation), aes(y=DO_Mean), color='red') +
+  theme_bw()
+```
+
+## Analyze: low-O2 events
+
+```{r print_lowo2}
+g
+```
+
+## Analyze: low-O2 events
+
+```{r violations, echo=TRUE}
+o2_violations <- filter(o2data_daily, Violation)
+```
+
+```{r print_violations}
+o2_violations %>% print(n=nrow(.))
+```
+
+## Analyze: `streamMetabolizer`
+
+```{r getmetabdata, echo=TRUE, eval=FALSE}
+nwisdata <- renameNWISColumns(readNWISuv(
+  siteNumbers='02336300',
+  parameterCd=c('00300','00060','00010'), # oxygen (mg/L), discharge (cfs), water temperature (C)
+  startDate='2015-01-01', endDate='2016-01-01', tz='UTC'))
+coords <- readNWISsite('02336300')
+```
+
+```{r loadmetabdata, include=FALSE}
+# saveRDS(nwisdata, 'nwisdata.Rds')
+# saveRDS(coords, 'coords.Rds')
+nwisdata <- readRDS('nwisdata.Rds')
+coords <- readRDS('coords.Rds')
+```
+
+```{r metab, echo=TRUE, cache=TRUE}
+library(streamMetabolizer)
+metabdata <- nwisdata %>%
+  mutate(
+    solar.time = convert_UTC_to_solartime(dateTime, longitude=coords$dec_long_va, time.type='mean solar'),
+    discharge = Flow_Inst * 0.0283168, # cfs to cms
+    depth = calc_depth(discharge), # uses Raymond et al. 2012 to estimate depth from discharge
+    DO.sat = calc_DO_sat(Wtemp_Inst, calc_air_pressure(elevation=coords$alt_va * 0.3048)), # serious modeling would use better inputs here
+    light = calc_light(solar.time, latitude=coords$dec_lat_va, longitude=coords$dec_long_va)) %>%
+  select(solar.time, DO.obs=DO_Inst, DO.sat, depth, temp.water=Wtemp_Inst, light)
+# mm <- metab(specs(mm_name('bayes')), data=metabdata)
+```
+
+## Analyze: metabolism at scale (Powell Center synthesis)
+
+```{r get_metab, echo=TRUE, cache=TRUE, message=FALSE, warning=FALSE}
+library(mda.streams)
+mm_bayes <- 
+  get_ts(
+    c('sitedate_calcLon','gpp_estBest','er_estBest','K600_estBest'),
+    site_name='nwis_02336300') %>%
+  unitted::v() %>%
+  filter(sitedate >= '2013-01-01', sitedate <= '2017-01-01')
+```
+
+## Analyze: metabolism at scale (Powell Center synthesis)
+
+```{r prep_metabplot1, echo=TRUE}
+library(cowplot)
+g <- plot_grid(
+  ggplot(mm_bayes, aes(x=sitedate, y=gpp)) +
+    geom_hline(yintercept=0, color='darkgrey') +
+    geom_point(color='#007929', alpha=0.2) +
+    theme_bw() + xlab('') + ylab(expression(GPP~(gO[2]~m^{-2}~d^{-1}))),
+  ggplot(mm_bayes, aes(x=sitedate, y=er)) +
+    geom_hline(yintercept=0, color='darkgrey') +
+    geom_point(color='#A64B00', alpha=0.2) +
+    theme_bw() + xlab('') + ylab(expression(ER~(gO[2]~m^{-2}~d^{-1}))),
+  nrow=2, align='v')
+```
+
+## Analyze: metabolism at scale (Powell Center synthesis)
+
+```{r plot_metab1}
+g
+```
+
+## Analyze: rolling means
+
+```{r roll_metab, echo=TRUE}
+mm_bayes_rollmean <- mm_bayes %>%
+  filter(., complete.cases(.)) %>%
+  mutate(
+    gpp_roll = zoo::rollmean(gpp, k=15, na.pad=TRUE),
+    er_roll = zoo::rollmean(er, k=15, na.pad=TRUE),
+    K600_roll = zoo::rollmean(K600, k=15, na.pad=TRUE))
+```
+
+## Analyze: rolling means
+
+```{r prep_metabplot2, echo=TRUE}
+g <- plot_grid(
+  ggplot(mm_bayes_rollmean, aes(x=sitedate, y=gpp)) +
+    geom_hline(yintercept=0, color='darkgrey') +
+    geom_point(color='#007929', alpha=0.2) +
+    geom_line(aes(y=gpp_roll), color='#007929', na.rm=TRUE, size=1) +
+    theme_bw() + xlab('') + ylab(expression(GPP~(gO[2]~m^{-2}~d^{-1}))),
+  ggplot(mm_bayes_rollmean, aes(x=sitedate, y=er)) +
+    geom_hline(yintercept=0, color='darkgrey') +
+    geom_point(color='#A64B00', alpha=0.2) +
+    geom_line(aes(y=er_roll), color='#A64B00', na.rm=TRUE, size=1) +
+    theme_bw() + xlab('') + ylab(expression(ER~(gO[2]~m^{-2}~d^{-1}))),
+  nrow=2, align='v')
+```
+
+## Analyze: rolling means
+
+```{r plot_metab2}
+g
+```
+
+## Analyze: metabolism vs light
+
+```{r plot_light, echo=TRUE}
+ggplot(gdpdata, aes(x=DateTime, y=srad)) + geom_point()
+```
+
+## Analyze: metabolism vs light
+
+```{r join_lightmetab, echo=TRUE}
+lightmetab <- inner_join(mutate(gdpdata, date=as.Date(DateTime)), mm_bayes_rollmean, by=c(date='sitedate'))
+```
+
+## Analyze: metabolism vs light
+
+```{r print_lightmetab}
+head(lightmetab, 10)
+```
+
+## Analyze: metabolism vs light
+
+```{r lightmetab, echo=TRUE}
+g <- ggplot(lightmetab, aes(x=srad, y=gpp)) +
+  geom_point(na.rm=TRUE) +
+  xlab(expression('Shortwave radiation'~(W~m^{-2}))) +
+  ylab(expression('GPP'~(gO[2]~m^{-2}~d^{-1})))
+```
+
+```{r plot_lightmetab}
+g
+```
